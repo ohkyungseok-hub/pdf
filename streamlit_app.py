@@ -16,6 +16,12 @@ except ImportError:
     HAS_CANVAS = False
 
 try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+    HAS_IMG_COORDS = True
+except ImportError:
+    HAS_IMG_COORDS = False
+
+try:
     from docx import Document
     HAS_DOCX = True
 except ImportError:
@@ -70,6 +76,10 @@ def init_state():
         "draw_size": 3,
         "text_size": 14,
         "canvas_key": 0,
+        "text_click_pos": None,   # (x, y) in PDF coords
+        "text_tool_active": False,
+        "text_edit_tool_active": False,
+        "selected_block": None,   # {"text", "rect", "fontsize", "color"}
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -112,6 +122,38 @@ def hex_to_rgb01(hex_color):
 
 def canvas_to_pdf(cx, cy, scale):
     return cx / scale, cy / scale
+
+def find_text_block_at(page, pdf_x, pdf_y, tolerance=8):
+    """클릭 위치에서 가장 가까운 텍스트 블록 반환"""
+    pt = fitz.Point(pdf_x, pdf_y)
+    best = None
+    best_area = float("inf")
+    for block in page.get_text("dict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        rect = fitz.Rect(block["bbox"])
+        expanded = rect + (-tolerance, -tolerance, tolerance, tolerance)
+        if expanded.contains(pt):
+            area = rect.width * rect.height
+            if area < best_area:
+                best_area = area
+                # 첫 번째 span에서 폰트 정보 추출
+                spans = [s for ln in block.get("lines", []) for s in ln.get("spans", [])]
+                text = "".join(s["text"] for s in spans)
+                fontsize = spans[0]["size"] if spans else 12
+                color_int = spans[0].get("color", 0) if spans else 0
+                r = ((color_int >> 16) & 0xFF) / 255
+                g = ((color_int >> 8)  & 0xFF) / 255
+                b = ( color_int        & 0xFF) / 255
+                best = {
+                    "text": text,
+                    "rect": rect,
+                    "fontsize": round(fontsize, 1),
+                    "color": (r, g, b),
+                    "color_hex": "#{:02x}{:02x}{:02x}".format(
+                        int(r*255), int(g*255), int(b*255)),
+                }
+    return best
 
 # ─── 사이드바 ─────────────────────────────────────────────────────
 with st.sidebar:
@@ -237,52 +279,133 @@ with tab_viewer:
 
     # ── 도구 선택 ──
     st.markdown("##### 편집 도구")
-    tcol = st.columns(9)
-    tools_def = [
-        ("freedraw", "✏️ 펜"),
-        ("line",     "— 선"),
-        ("rect",     "▭ 사각형"),
-        ("circle",   "◯ 원"),
-        ("transform","↖ 선택"),
-    ]
-    tool_labels = {t: l for t, l in tools_def}
+    tcol = st.columns(11)
+    tool_labels = {
+        "freedraw": "✏️ 펜", "line": "— 선", "rect": "▭ 사각형",
+        "circle": "◯ 원", "transform": "↖ 선택",
+    }
+
+    def _is_draw_active(t):
+        return not st.session_state.text_tool_active and not st.session_state.text_edit_tool_active and st.session_state.draw_tool == t
 
     with tcol[0]:
-        if st.button("✏️ 펜", use_container_width=True):
+        if st.button("✏️ 펜", use_container_width=True,
+                     type="primary" if _is_draw_active("freedraw") else "secondary"):
             st.session_state.draw_tool = "freedraw"
+            st.session_state.text_tool_active = False
+            st.session_state.text_edit_tool_active = False
             st.rerun()
     with tcol[1]:
-        if st.button("— 선", use_container_width=True):
+        if st.button("— 선", use_container_width=True,
+                     type="primary" if _is_draw_active("line") else "secondary"):
             st.session_state.draw_tool = "line"
+            st.session_state.text_tool_active = False
+            st.session_state.text_edit_tool_active = False
             st.rerun()
     with tcol[2]:
-        if st.button("▭ 사각형", use_container_width=True):
+        if st.button("▭ 사각형", use_container_width=True,
+                     type="primary" if _is_draw_active("rect") else "secondary"):
             st.session_state.draw_tool = "rect"
+            st.session_state.text_tool_active = False
+            st.session_state.text_edit_tool_active = False
             st.rerun()
     with tcol[3]:
-        if st.button("◯ 원", use_container_width=True):
+        if st.button("◯ 원", use_container_width=True,
+                     type="primary" if _is_draw_active("circle") else "secondary"):
             st.session_state.draw_tool = "circle"
+            st.session_state.text_tool_active = False
+            st.session_state.text_edit_tool_active = False
             st.rerun()
     with tcol[4]:
-        if st.button("↖ 선택/이동", use_container_width=True):
+        if st.button("↖ 선택", use_container_width=True,
+                     type="primary" if _is_draw_active("transform") else "secondary"):
             st.session_state.draw_tool = "transform"
+            st.session_state.text_tool_active = False
+            st.session_state.text_edit_tool_active = False
+            st.rerun()
+    with tcol[5]:
+        if st.button("🔤 텍스트 추가", use_container_width=True,
+                     type="primary" if st.session_state.text_tool_active else "secondary"):
+            st.session_state.text_tool_active = True
+            st.session_state.text_edit_tool_active = False
+            st.session_state.text_click_pos = None
+            st.rerun()
+    with tcol[6]:
+        if st.button("✏️ 텍스트 편집", use_container_width=True,
+                     type="primary" if st.session_state.text_edit_tool_active else "secondary"):
+            st.session_state.text_edit_tool_active = True
+            st.session_state.text_tool_active = False
+            st.session_state.selected_block = None
             st.rerun()
 
-    with tcol[5]:
+    with tcol[7]:
         st.session_state.draw_color = st.color_picker(
             "색상", st.session_state.draw_color, label_visibility="collapsed")
-    with tcol[6]:
+    with tcol[8]:
         st.session_state.draw_size = st.slider(
             "굵기", 1, 15, st.session_state.draw_size,
             label_visibility="collapsed")
-    with tcol[7]:
+    with tcol[9]:
         fill_shape = st.checkbox("채우기", False)
 
     cur_tool = st.session_state.draw_tool
-    st.caption(f"현재 도구: **{tool_labels.get(cur_tool, cur_tool)}**  |  색상: {st.session_state.draw_color}  |  굵기: {st.session_state.draw_size}")
 
-    # ── 텍스트 추가 (인라인) ──
-    with st.expander("📝 텍스트 추가", expanded=False):
+    if st.session_state.text_edit_tool_active:
+        st.caption("현재 도구: **✏️ 텍스트 편집**  |  수정할 텍스트를 PDF 위에서 클릭하세요")
+    elif st.session_state.text_tool_active:
+        st.caption("현재 도구: **🔤 텍스트 추가**  |  텍스트를 추가할 위치를 클릭하세요")
+    else:
+        st.caption(f"현재 도구: **{tool_labels.get(cur_tool, cur_tool)}**  |  색상: {st.session_state.draw_color}  |  굵기: {st.session_state.draw_size}")
+
+    # ── 텍스트 도구: 클릭 위치 선택 ──
+    if st.session_state.text_tool_active and HAS_IMG_COORDS:
+        st.info("📍 텍스트를 추가할 위치를 PDF 위에서 클릭하세요")
+        coords = streamlit_image_coordinates(img, key=f"img_coords_{st.session_state.canvas_key}")
+
+        if coords is not None:
+            # 클릭 좌표를 PDF 좌표로 변환
+            pdf_x = coords["x"] / scale
+            pdf_y = coords["y"] / scale
+            st.session_state.text_click_pos = (pdf_x, pdf_y)
+
+        if st.session_state.text_click_pos:
+            px, py = st.session_state.text_click_pos
+            st.success(f"📍 선택된 위치: X={px:.1f}, Y={py:.1f} (PDF 좌표)")
+            ti_col1, ti_col2, ti_col3 = st.columns([4, 1, 1])
+            with ti_col1:
+                inline_text = st.text_input("추가할 텍스트", placeholder="텍스트를 입력하세요...",
+                                             key="inline_text_input")
+            with ti_col2:
+                inline_size = st.number_input("크기", value=14, min_value=6, key="inline_text_size")
+            with ti_col3:
+                inline_color = st.color_picker("색상", "#000000", key="inline_text_color")
+
+            btn_col1, btn_col2 = st.columns(2)
+            with btn_col1:
+                if st.button("✅ 텍스트 추가", type="primary", use_container_width=True):
+                    if inline_text:
+                        push_undo()
+                        doc = get_pdf()
+                        page = doc[st.session_state.current_page]
+                        r, g, b = hex_to_rgb01(inline_color)
+                        page.insert_text((px, py), inline_text,
+                                          fontsize=inline_size, color=(r, g, b))
+                        save_pdf(doc)
+                        doc.close()
+                        st.session_state.text_click_pos = None
+                        st.session_state.canvas_key += 1
+                        st.success(f'텍스트 추가됨: "{inline_text}"')
+                        st.rerun()
+                    else:
+                        st.warning("텍스트를 입력하세요")
+            with btn_col2:
+                if st.button("❌ 취소", use_container_width=True):
+                    st.session_state.text_click_pos = None
+                    st.rerun()
+
+    elif st.session_state.text_tool_active and not HAS_IMG_COORDS:
+        # fallback: 수동 좌표 입력
+        st.warning("streamlit-image-coordinates 패키지가 필요합니다: pip install streamlit-image-coordinates")
         tc1, tc2, tc3, tc4 = st.columns([3,1,1,1])
         with tc1:
             add_text_val = st.text_input("텍스트", placeholder="입력하세요...")
@@ -293,7 +416,6 @@ with tab_viewer:
         with tc4:
             add_text_size = st.number_input("크기", value=14, min_value=6)
         tcolor = st.color_picker("텍스트 색상", "#000000")
-
         if st.button("텍스트 PDF에 추가", type="primary"):
             if add_text_val:
                 push_undo()
@@ -308,103 +430,163 @@ with tab_viewer:
                 st.success(f'텍스트 추가됨: "{add_text_val}"')
                 st.rerun()
 
-    # ── 캔버스 ──
-    if HAS_CANVAS:
-        fill_color = (st.session_state.draw_color + "44") if fill_shape else "rgba(0,0,0,0)"
+    # ── 텍스트 편집 도구 ──
+    if st.session_state.text_edit_tool_active and HAS_IMG_COORDS:
+        st.info("🖱️ 수정할 텍스트를 PDF 위에서 클릭하세요")
+        edit_coords = streamlit_image_coordinates(img, key=f"edit_coords_{st.session_state.canvas_key}")
 
-        canvas_result = st_canvas(
-            fill_color=fill_color,
-            stroke_width=st.session_state.draw_size,
-            stroke_color=st.session_state.draw_color,
-            background_image=img,
-            update_streamlit=True,
-            height=canvas_h,
-            width=display_width,
-            drawing_mode=cur_tool,
-            key=f"canvas_{st.session_state.canvas_key}",
-        )
+        if edit_coords is not None:
+            pdf_ex = edit_coords["x"] / scale
+            pdf_ey = edit_coords["y"] / scale
+            doc = get_pdf()
+            page = doc[st.session_state.current_page]
+            blk = find_text_block_at(page, pdf_ex, pdf_ey)
+            doc.close()
+            if blk:
+                st.session_state.selected_block = blk
+            else:
+                st.warning("해당 위치에서 텍스트를 찾지 못했습니다. 다시 클릭해보세요.")
 
-        # 그리기 결과 PDF에 적용
-        if st.button("🖊️ 그린 내용 PDF에 적용", type="primary"):
-            if canvas_result.json_data and canvas_result.json_data.get("objects"):
-                objects = canvas_result.json_data["objects"]
-                if objects:
+        if st.session_state.selected_block:
+            blk = st.session_state.selected_block
+            st.success(f"선택된 텍스트: **{blk['text'][:60]}{'...' if len(blk['text'])>60 else ''}**")
+
+            ed_col1, ed_col2, ed_col3 = st.columns([4, 1, 1])
+            with ed_col1:
+                edited_text = st.text_area("수정할 내용", value=blk["text"],
+                                            height=80, key="edit_text_area")
+            with ed_col2:
+                edit_size = st.number_input("크기", value=float(blk["fontsize"]),
+                                             min_value=4.0, step=0.5, key="edit_text_size")
+            with ed_col3:
+                edit_color = st.color_picker("색상", blk["color_hex"], key="edit_text_color")
+
+            eb1, eb2 = st.columns(2)
+            with eb1:
+                if st.button("✅ 텍스트 교체", type="primary", use_container_width=True):
                     push_undo()
                     doc = get_pdf()
                     page = doc[st.session_state.current_page]
-                    r, g, b = hex_to_rgb01(st.session_state.draw_color)
-                    lw = max(st.session_state.draw_size * 0.5, 0.5)
+                    rect = blk["rect"]
+                    # 기존 텍스트 영역을 흰색으로 가리기 (redaction)
+                    page.add_redact_annot(rect, fill=(1, 1, 1))
+                    page.apply_redactions()
+                    # 새 텍스트 삽입 (baseline = rect.y1 기준)
+                    r2, g2, b2 = hex_to_rgb01(edit_color)
+                    page.insert_text(
+                        (rect.x0, rect.y0 + edit_size),
+                        edited_text,
+                        fontsize=edit_size,
+                        color=(r2, g2, b2),
+                    )
+                    save_pdf(doc)
+                    doc.close()
+                    st.session_state.selected_block = None
+                    st.session_state.canvas_key += 1
+                    st.success("텍스트가 교체됐습니다!")
+                    st.rerun()
+            with eb2:
+                if st.button("❌ 취소", use_container_width=True, key="edit_cancel"):
+                    st.session_state.selected_block = None
+                    st.rerun()
 
-                    for obj in objects:
-                        otype = obj.get("type", "")
+    # ── 캔버스 (그리기 도구) ──
+    if not st.session_state.text_tool_active and not st.session_state.text_edit_tool_active:
+        if HAS_CANVAS:
+            fill_color = (st.session_state.draw_color + "44") if fill_shape else "rgba(0,0,0,0)"
 
-                        if otype == "path":
-                            # 자유 그리기
-                            path_str = obj.get("path", [])
-                            pts = []
-                            for cmd in path_str:
-                                if cmd[0] in ("M", "L", "Q", "C") and len(cmd) >= 3:
-                                    pts.append((cmd[-2] / scale, cmd[-1] / scale))
-                            for i in range(len(pts) - 1):
-                                p1 = fitz.Point(pts[i])
-                                p2 = fitz.Point(pts[i+1])
+            canvas_result = st_canvas(
+                fill_color=fill_color,
+                stroke_width=st.session_state.draw_size,
+                stroke_color=st.session_state.draw_color,
+                background_image=img,
+                update_streamlit=True,
+                height=canvas_h,
+                width=display_width,
+                drawing_mode=cur_tool,
+                key=f"canvas_{st.session_state.canvas_key}",
+            )
+
+            # 그리기 결과 PDF에 적용
+            if st.button("🖊️ 그린 내용 PDF에 적용", type="primary"):
+                if canvas_result.json_data and canvas_result.json_data.get("objects"):
+                    objects = canvas_result.json_data["objects"]
+                    if objects:
+                        push_undo()
+                        doc = get_pdf()
+                        page = doc[st.session_state.current_page]
+                        r, g, b = hex_to_rgb01(st.session_state.draw_color)
+                        lw = max(st.session_state.draw_size * 0.5, 0.5)
+
+                        for obj in objects:
+                            otype = obj.get("type", "")
+
+                            if otype == "path":
+                                path_str = obj.get("path", [])
+                                pts = []
+                                for cmd in path_str:
+                                    if cmd[0] in ("M", "L", "Q", "C") and len(cmd) >= 3:
+                                        pts.append((cmd[-2] / scale, cmd[-1] / scale))
+                                for i in range(len(pts) - 1):
+                                    p1 = fitz.Point(pts[i])
+                                    p2 = fitz.Point(pts[i+1])
+                                    ann = page.add_line_annot(p1, p2)
+                                    ann.set_colors(stroke=(r,g,b))
+                                    ann.set_border(width=lw)
+                                    ann.update()
+
+                            elif otype == "line":
+                                x1 = obj.get("x1", 0) + obj.get("left", 0)
+                                y1 = obj.get("y1", 0) + obj.get("top", 0)
+                                x2 = obj.get("x2", 0) + obj.get("left", 0)
+                                y2 = obj.get("y2", 0) + obj.get("top", 0)
+                                p1 = fitz.Point(x1 / scale, y1 / scale)
+                                p2 = fitz.Point(x2 / scale, y2 / scale)
                                 ann = page.add_line_annot(p1, p2)
                                 ann.set_colors(stroke=(r,g,b))
                                 ann.set_border(width=lw)
                                 ann.update()
 
-                        elif otype == "line":
-                            x1 = obj.get("x1", 0) + obj.get("left", 0)
-                            y1 = obj.get("y1", 0) + obj.get("top", 0)
-                            x2 = obj.get("x2", 0) + obj.get("left", 0)
-                            y2 = obj.get("y2", 0) + obj.get("top", 0)
-                            p1 = fitz.Point(x1 / scale, y1 / scale)
-                            p2 = fitz.Point(x2 / scale, y2 / scale)
-                            ann = page.add_line_annot(p1, p2)
-                            ann.set_colors(stroke=(r,g,b))
-                            ann.set_border(width=lw)
-                            ann.update()
+                            elif otype == "rect":
+                                left   = obj.get("left", 0)
+                                top    = obj.get("top", 0)
+                                width  = obj.get("width", 0)  * obj.get("scaleX", 1)
+                                height = obj.get("height", 0) * obj.get("scaleY", 1)
+                                rect = fitz.Rect(
+                                    left / scale, top / scale,
+                                    (left + width) / scale, (top + height) / scale)
+                                ann = page.add_rect_annot(rect)
+                                ann.set_colors(stroke=(r,g,b),
+                                               fill=(hex_to_rgb01(st.session_state.draw_color)
+                                                     if fill_shape else None))
+                                ann.set_border(width=lw)
+                                ann.update()
 
-                        elif otype == "rect":
-                            left   = obj.get("left", 0)
-                            top    = obj.get("top", 0)
-                            width  = obj.get("width", 0)  * obj.get("scaleX", 1)
-                            height = obj.get("height", 0) * obj.get("scaleY", 1)
-                            rect = fitz.Rect(
-                                left / scale, top / scale,
-                                (left + width) / scale, (top + height) / scale)
-                            ann = page.add_rect_annot(rect)
-                            ann.set_colors(stroke=(r,g,b),
-                                           fill=(hex_to_rgb01(st.session_state.draw_color)
-                                                 if fill_shape else None))
-                            ann.set_border(width=lw)
-                            ann.update()
+                            elif otype == "ellipse":
+                                left   = obj.get("left", 0)
+                                top    = obj.get("top", 0)
+                                rx     = obj.get("rx", 0) * obj.get("scaleX", 1)
+                                ry     = obj.get("ry", 0) * obj.get("scaleY", 1)
+                                cx_pdf = (left + rx) / scale
+                                cy_pdf = (top + ry) / scale
+                                rect = fitz.Rect(
+                                    cx_pdf - rx/scale, cy_pdf - ry/scale,
+                                    cx_pdf + rx/scale, cy_pdf + ry/scale)
+                                ann = page.add_circle_annot(rect)
+                                ann.set_colors(stroke=(r,g,b))
+                                ann.set_border(width=lw)
+                                ann.update()
 
-                        elif otype == "ellipse":
-                            left   = obj.get("left", 0)
-                            top    = obj.get("top", 0)
-                            rx     = obj.get("rx", 0) * obj.get("scaleX", 1)
-                            ry     = obj.get("ry", 0) * obj.get("scaleY", 1)
-                            cx_pdf = (left + rx) / scale
-                            cy_pdf = (top + ry) / scale
-                            rect = fitz.Rect(
-                                cx_pdf - rx/scale, cy_pdf - ry/scale,
-                                cx_pdf + rx/scale, cy_pdf + ry/scale)
-                            ann = page.add_circle_annot(rect)
-                            ann.set_colors(stroke=(r,g,b))
-                            ann.set_border(width=lw)
-                            ann.update()
-
-                    save_pdf(doc)
-                    doc.close()
-                    st.session_state.canvas_key += 1
-                    st.success(f"{len(objects)}개 객체가 PDF에 적용됐습니다!")
-                    st.rerun()
-            else:
-                st.info("캔버스에 그린 내용이 없습니다")
-    else:
-        st.image(img, use_container_width=False, width=display_width)
-        st.warning("streamlit-drawable-canvas 설치가 필요합니다: pip install streamlit-drawable-canvas")
+                        save_pdf(doc)
+                        doc.close()
+                        st.session_state.canvas_key += 1
+                        st.success(f"{len(objects)}개 객체가 PDF에 적용됐습니다!")
+                        st.rerun()
+                else:
+                    st.info("캔버스에 그린 내용이 없습니다")
+        else:
+            st.image(img, use_container_width=False, width=display_width)
+            st.warning("streamlit-drawable-canvas 설치가 필요합니다: pip install streamlit-drawable-canvas")
 
 # ════════════════════════════════════════════════
 # 탭 2: 페이지 편집
